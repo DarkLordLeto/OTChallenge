@@ -81,8 +81,9 @@ Single-provider dual-pass pipeline. Claude performs the triage pass with tool us
 | `verify_insurance` | Yes | Result forks the workflow: in-network to intake task; out-of-network to billing task, no slot hold | 1, 3, 4, 7 |
 | `escalate` | Yes | Required by policy for P0 safeguarding and P1 same-day changes | 2, 8 |
 | `create_task` | Yes | Creates concrete staff follow-up; assignee reflects triage decision | 1-8 |
-| `find_slots` | Yes | Called for reschedule flow after `escalate`; surfaces available options | 8 |
-| `hold_slot` | Yes | Called after `find_slots`; places earliest slot in `pending_review` | 8 |
+| `search_patient` | Yes | Called first in reschedule flow; `patient_id` from result is used as `patient_ref` in `hold_slot` | 8 |
+| `find_slots` | Yes | Called after `search_patient` for reschedule flow; surfaces available slots | 8 |
+| `hold_slot` | Yes | Called after `find_slots`; `patient_ref` = `patient_id` from `search_patient` | 8 |
 | `draft_message` | Yes | Composes outbound reply as a draft (never auto-sent); `body` arg becomes `draft_reply` in output | 1–8 |
 | `search_patient` | No | Not selected for the current implementation | - |
 | `lookup_policy` | No | Not selected; policy logic is encoded in prompts/review rules | - |
@@ -93,10 +94,11 @@ For item 8 (`Noah Patel`, same-day OT cancellation):
 
 ```text
 1. escalate(item_id="item_8", reason="Same-day cancellation request", severity="P1")
-2. find_slots(discipline="OT")
-3. hold_slot(slot_id=<earliest>, patient_ref="Noah Patel")
-4. create_task(assignee="front_desk", notes include hold_id and contact info)
-5. draft_message(recipient, channel, body mentioning hold and next steps)
+2. search_patient(name="Noah Patel", dob="2017-11-02")  → patient_id="pat_noah_patel"
+3. find_slots(discipline="OT")                          → available OT slots
+4. hold_slot(slot_id=<earliest>, patient_ref="pat_noah_patel")  ← patient_id from step 2
+5. create_task(assignee="front_desk", notes include patient_id + hold_id)
+6. draft_message(recipient, channel, body mentioning hold and next steps)
 ```
 
 `hold_slot` is always `pending_review`; the agent does not confirm appointments autonomously.

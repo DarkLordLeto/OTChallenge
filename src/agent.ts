@@ -20,16 +20,21 @@
  *        front_desk   → scheduling changes, missing-info follow-ups
  *        Used for all 8 items — the assignee and notes reflect the triage decision.
  *
- *   4. find_slots — searches available appointment slots for a given discipline.
- *        Called for scheduling / reschedule items (e.g. item 8) after escalate(),
+ *   4. search_patient — looks up the existing patient record by name + DOB.
+ *        Called FIRST for scheduling / reschedule items so the patient_id
+ *        returned is used as patient_ref in hold_slot, tying the hold to
+ *        the verified record rather than a raw name string.
+ *
+ *   5. find_slots — searches available appointment slots for a given discipline.
+ *        Called for scheduling / reschedule items after search_patient,
  *        so staff can see concrete options when they review the hold.
  *
- *   5. hold_slot — places the earliest suitable slot in pending_review status.
- *        Called after find_slots when a matching slot exists. Always followed by
- *        create_task so staff know to confirm or release the hold.
+ *   6. hold_slot — places the earliest suitable slot in pending_review status.
+ *        Called after find_slots when a matching slot exists. patient_ref is
+ *        the patient_id from search_patient. Always followed by create_task.
  *        Result is always pending_review — this is NOT a confirmed appointment.
  *
- *   6. draft_message — composes outbound replies as drafts; NEVER auto-sent.
+ *   7. draft_message — composes outbound replies as drafts; NEVER auto-sent.
  *        Called for every item that warrants a reply to the family or referrer.
  *        The `body` arg is captured and surfaced as `draft_reply` in the output.
  *        Channel is chosen from context (email/phone/portal); language "es" for
@@ -51,6 +56,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import {
   withItemContext,
   getToolCallsForItem,
+  search_patient,
   verify_insurance,
   escalate,
   create_task,
@@ -143,10 +149,33 @@ const TOOL_DEFINITIONS: Anthropic.Tool[] = [
     },
   },
   {
+    name: "search_patient",
+    description: [
+      "Look up an existing patient record by name and/or date of birth.",
+      "Call this FIRST for any scheduling or reschedule item before find_slots or hold_slot.",
+      "The patient_id returned by this tool must be used as patient_ref in hold_slot,",
+      "tying the slot hold to the verified patient record.",
+      "If no match is found, use the patient's full name as patient_ref instead.",
+    ].join(" "),
+    input_schema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Patient full name — infer from item body",
+        },
+        dob: {
+          type: "string",
+          description: "Date of birth in YYYY-MM-DD format — use when present in the item",
+        },
+      },
+    },
+  },
+  {
     name: "find_slots",
     description: [
       "Search available appointment slots for a discipline.",
-      "Use for scheduling / reschedule items AFTER calling escalate().",
+      "Use for scheduling / reschedule items AFTER search_patient.",
       "Returns up to 5 slots with provider name, start time, and slot_id.",
       "If no slots are found, do not call hold_slot; note availability in recommended_next_action.",
     ].join(" "),
@@ -188,7 +217,7 @@ const TOOL_DEFINITIONS: Anthropic.Tool[] = [
         },
         patient_ref: {
           type: "string",
-          description: "Patient full name for the hold reference",
+          description: "patient_id from search_patient result, or full name if no record found",
         },
       },
     },
@@ -241,17 +270,19 @@ Triage each referral inbox item. Use the available tools to gather information a
 ## Tool usage rules
 - verify_insurance: call for EVERY item that includes payer or member_id. Use the result to decide the next action (in_network → intake; out_of_network/expired → billing; no slot hold for OON).
 - escalate: REQUIRED for safeguarding signals (P0) and same-day cancellations/reschedules (P1). Must be called before other tools for those items.
-- find_slots: call for scheduling/reschedule items (classification: "scheduling") to surface available slots for the patient's discipline. Call AFTER escalate.
-- hold_slot: call after find_slots when slots are available. Use the earliest slot_id. Result is always pending_review — NOT a confirmed appointment.
+- search_patient: call for scheduling/reschedule items to verify the patient record. Use the returned patient_id as patient_ref in hold_slot.
+- find_slots: call after search_patient for scheduling/reschedule items to surface available slots for the patient's discipline.
+- hold_slot: call after find_slots when slots are available. Use the earliest slot_id and the patient_id from search_patient as patient_ref. Result is always pending_review — NOT a confirmed appointment.
 - create_task: call for EVERY item to assign concrete staff follow-up. Must follow hold_slot with a task for front_desk to confirm the hold. Assignee must match the situation.
 - draft_message: call for EVERY item that warrants an outbound reply. The body you write becomes the draft_reply field — leave draft_reply null in your JSON. Message is never auto-sent.
 
 ## Reschedule workflow (e.g. same-day cancellation)
 1. escalate(item_id, reason, "P1")
-2. find_slots(discipline)  ← use the discipline from the patient's existing appointment
-3. hold_slot(slot_id, patient_ref)  ← earliest available slot; pending_review only
-4. create_task(front_desk, "Confirm reschedule hold for <patient>", due=today, notes including hold details)
-5. draft_message(recipient, channel, body mentioning the pending hold and next steps)
+2. search_patient(name, dob)          ← verify the patient record; capture patient_id
+3. find_slots(discipline)             ← discipline from the patient's existing appointment
+4. hold_slot(slot_id, patient_ref)    ← earliest slot; patient_ref = patient_id from step 2
+5. create_task(front_desk, "Confirm reschedule hold for <patient>", due=today, notes with patient_id + hold_id)
+6. draft_message(recipient, channel, body mentioning the pending hold and next steps)
 
 ## Classification guide
 - new_referral: complete or partial referral for a new evaluation
@@ -317,6 +348,10 @@ async function dispatchTool(
   input: ToolInput,
 ): Promise<DispatchResult> {
   switch (name) {
+    case "search_patient":
+      return search_patient(
+        input as { name?: string; dob?: string },
+      );
     case "verify_insurance":
       return verify_insurance(
         input as { payer?: string; member_id?: string },
@@ -537,8 +572,9 @@ Rules to enforce (check each one):
    escalation must not be null and severity must be "P0".
 2. SAME-DAY RESCHEDULE/CANCELLATION — classification "scheduling", urgency "P1",
    escalation must not be null and severity must be "P1",
+   tools_called must include search_patient (to verify the patient record first),
    tools_called must include find_slots (to surface available slots for staff review),
-   tools_called must include hold_slot (to place a pending_review hold),
+   tools_called must include hold_slot (patient_ref must be the patient_id from search_patient),
    tools_called must include create_task for front_desk to confirm the hold.
 3. OUT-OF-NETWORK insurance (Kaiser, Cigna Select, Beacon):
    tools_called must include verify_insurance;
