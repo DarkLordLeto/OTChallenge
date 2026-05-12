@@ -459,6 +459,8 @@ interface TriageDraft {
   escalationResult: { reason: string; severity: "P0" | "P1" } | null;
   /** Plain-text log of tool calls for use in revision prompts */
   toolLog: string[];
+  /** Policy snippets retrieved during Phase 1 — keyed by topic — used to ground the reviewer */
+  policySnippets: Record<string, string>;
 }
 
 async function triageWithClaude(
@@ -470,6 +472,7 @@ async function triageWithClaude(
   let draftReply: string | null = null;
   let escalationResult: { reason: string; severity: "P0" | "P1" } | null = null;
   const toolLog: string[] = [];
+  const policySnippets: Record<string, string> = {};
 
   const userText = feedbackFromReviewer
     ? `Triage the inbox item below. A quality reviewer rejected a previous attempt — fix all issues listed.\n\n<reviewer_feedback>\n${feedbackFromReviewer}\n</reviewer_feedback>\n\nInbox item:\n${JSON.stringify(item, null, 2)}`
@@ -503,7 +506,15 @@ async function triageWithClaude(
       parsed.escalation = escalationResult;
       parsed.requires_human_review = true;
 
-      return { output: parsed, taskIds, holdIds, draftReply, escalationResult, toolLog };
+      return {
+        output: parsed,
+        taskIds,
+        holdIds,
+        draftReply,
+        escalationResult,
+        toolLog,
+        policySnippets,
+      };
     }
 
     if (response.stop_reason === "tool_use") {
@@ -524,6 +535,11 @@ async function triageWithClaude(
           }
           if (block.name === "hold_slot") {
             holdIds.push((result.data as { hold_id: string }).hold_id);
+          }
+          if (block.name === "lookup_policy") {
+            // Capture policy snippets so the reviewer can be grounded in real policy text
+            const inp = block.input as { topic: string };
+            policySnippets[inp.topic] = result.result_summary;
           }
           if (block.name === "draft_message") {
             // Capture the message body as the authoritative draft_reply
@@ -656,17 +672,39 @@ Rules to enforce (check each one):
 async function reviewWithClaude(
   item: InboxItem,
   output: ItemOutput,
+  policySnippets: Record<string, string>,
 ): Promise<ReviewResult> {
+  // Inject actual policy text retrieved during Phase 1 so the reviewer
+  // cannot hallucinate rules that contradict the real policy document.
+  const policyContext =
+    Object.keys(policySnippets).length > 0
+      ? [
+          "## Actual clinic policy (ground every rule-check in this text)",
+          ...Object.entries(policySnippets).map(
+            ([topic, snippet]) => `[${topic}]\n${snippet}`,
+          ),
+          "",
+          "IMPORTANT: Only report a violation if it is directly supported by",
+          "the policy text above or by one of the explicit rules below.",
+          "Do NOT invent rules that are absent from both sources.",
+        ].join("\n")
+      : "";
+
   const response = await anthropic.messages.create({
     model: REVIEW_MODEL,
     max_tokens: 1200,
     system:
       "You are a strict policy reviewer for a medical intake triage system. " +
-      "Check every rule. Return only valid JSON.",
+      "Check every rule against the provided policy text and the triage output. " +
+      "Before reporting any violation, confirm the violation is actually present " +
+      "in the output — do NOT flag something that is already correctly handled. " +
+      "Return only valid JSON.",
     messages: [
       {
         role: "user",
         content: [
+          policyContext,
+          policyContext ? "" : undefined,
           REVIEW_RULES,
           "",
           "## Inbox item",
@@ -675,11 +713,20 @@ async function reviewWithClaude(
           "## Triage output",
           JSON.stringify(output, null, 2),
           "",
+          "Checklist before returning approved=false:",
+          "- Is draft_reply actually null? (check the field above)",
+          "- Is escalation actually missing? (check the field above)",
+          "- Are tools_called actually empty? (check the array above)",
+          "- Are task_ids actually empty? (check the array above)",
+          "Only list rules that are truly violated. Do not repeat rules that already pass.",
+          "",
           "Return a raw JSON object — no markdown fences, no explanation, no extra keys:",
           '{"approved": true, "feedback": ""}',
           "or",
-          '{"approved": false, "feedback": "<concise list of violated rules>"}',
-        ].join("\n"),
+          '{"approved": false, "feedback": "<concise numbered list of violated rules — each grounded in policy text or output facts>"}',
+        ]
+          .filter((l) => l !== undefined)
+          .join("\n"),
       },
     ],
   });
@@ -700,6 +747,83 @@ async function reviewWithClaude(
   }
 }
 
+// ─── Contradiction filter ─────────────────────────────────────────────────────
+
+/**
+ * Remove reviewer feedback lines that are provably false given the actual
+ * output fields.  Keeps the feedback string clean so reviseOutput() is not
+ * asked to "fix" things that are already correct — the root cause of
+ * internally contradictory revision loops.
+ *
+ * Returns the filtered feedback (may be empty string if all claims were false).
+ */
+function filterContradictions(output: ItemOutput, feedback: string): string {
+  const toolNames = new Set(output.tools_called.map((t) => t.name));
+
+  const checks: Array<{ pattern: RegExp; alreadySatisfied: () => boolean }> = [
+    // draft_reply
+    {
+      pattern: /draft_reply\b.*\bnull\b|\bnull\b.*\bdraft_reply\b|draft_reply.*missing|no draft/i,
+      alreadySatisfied: () => output.draft_reply !== null,
+    },
+    // escalation
+    {
+      pattern: /escalation.*missing|escalation.*null|no escalation|escalation.*not.*set|missing.*escalation/i,
+      alreadySatisfied: () => output.escalation !== null,
+    },
+    // tools_called
+    {
+      pattern: /tools_called.*empty|no tools.*called|tools.*not.*called/i,
+      alreadySatisfied: () => output.tools_called.length > 0,
+    },
+    // task_ids
+    {
+      pattern: /task_ids.*empty|no task.*created|task.*not.*created/i,
+      alreadySatisfied: () => output.task_ids.length > 0,
+    },
+    // requires_human_review
+    {
+      pattern: /requires_human_review.*false|not.*true.*human|human.*review.*false/i,
+      alreadySatisfied: () => output.requires_human_review === true,
+    },
+    // specific tool presence
+    {
+      pattern: /\bhold_slot\b.*not.*called|missing.*\bhold_slot\b/i,
+      alreadySatisfied: () => toolNames.has("hold_slot"),
+    },
+    {
+      pattern: /\bsearch_patient\b.*not.*called|missing.*\bsearch_patient\b/i,
+      alreadySatisfied: () => toolNames.has("search_patient"),
+    },
+    {
+      pattern: /\bfind_slots\b.*not.*called|missing.*\bfind_slots\b/i,
+      alreadySatisfied: () => toolNames.has("find_slots"),
+    },
+    {
+      pattern: /\bverify_insurance\b.*not.*called|missing.*\bverify_insurance\b/i,
+      alreadySatisfied: () => toolNames.has("verify_insurance"),
+    },
+    {
+      pattern: /\blookup_policy\b.*not.*called|missing.*\blookup_policy\b/i,
+      alreadySatisfied: () => toolNames.has("lookup_policy"),
+    },
+  ];
+
+  const lines = feedback.split(/\n/).filter((l) => l.trim());
+  const valid = lines.filter((line) => {
+    const contradicted = checks.some(
+      (c) => c.pattern.test(line) && c.alreadySatisfied(),
+    );
+    if (contradicted) {
+      // Log dropped lines so the developer can see what was filtered
+      console.log(`  [filter] dropped contradictory feedback: ${line.trim()}`);
+    }
+    return !contradicted;
+  });
+
+  return valid.join("\n").trim();
+}
+
 // ─── Per-item orchestration ───────────────────────────────────────────────────
 
 async function processItem(item: InboxItem): Promise<ItemOutput> {
@@ -712,19 +836,26 @@ async function processItem(item: InboxItem): Promise<ItemOutput> {
 
   // Review + revision loop (revision never makes new tool calls)
   for (let revision = 0; revision < MAX_REVISIONS; revision++) {
-    const review = await reviewWithClaude(item, output);
+    const review = await reviewWithClaude(item, output, draft.policySnippets);
     const verdict = review.approved ? "✓ approved" : "✗ rejected";
     console.log(`  [${item.id}] review ${revision + 1}: ${verdict}`);
 
     if (review.approved) return output;
 
-    console.log(`  [${item.id}] feedback: ${review.feedback}`);
+    // Strip claims that contradict observable output facts
+    const validFeedback = filterContradictions(output, review.feedback);
+    if (!validFeedback) {
+      console.log(`  [${item.id}] all reviewer claims contradicted facts — treating as approved`);
+      return output;
+    }
+
+    console.log(`  [${item.id}] feedback: ${validFeedback}`);
 
     output = await reviseOutput(
       item,
       output,
       draft.toolLog,
-      review.feedback,
+      validFeedback,
     );
     // Ensure authoritative trace values are preserved after revision
     output.tools_called = getToolCallsForItem(item.id);
@@ -735,7 +866,7 @@ async function processItem(item: InboxItem): Promise<ItemOutput> {
   }
 
   // Final check after last revision
-  const final = await reviewWithClaude(item, output);
+  const final = await reviewWithClaude(item, output, draft.policySnippets);
   console.log(
     `  [${item.id}] final: ${final.approved ? "✓ approved" : "✗ using last output"}`,
   );

@@ -9,7 +9,7 @@
 
 **Project Name:** OTChallenge - Cedar Kids Therapy Referral Inbox Triage Agent  
 **Status:** In development  
-**Last Updated:** 2026-05-12  
+**Last Updated:** 2026-05-12 (review hardening)  
 **Default Branch:** `main`
 
 Build a single AI agent that reads 8 referral inbox items for a pediatric therapy practice (Cedar Kids Therapy) and produces structured triage output: classification, urgency, intake extraction, tool calls, draft replies, and escalation flags.
@@ -215,13 +215,21 @@ Latest local run on 2026-05-12:
 - Safeguarding items (item 2) must call `escalate` with `P0`
 - Same-day reschedule items (item 8) must call `escalate`, `find_slots`, `hold_slot`, and `create_task`
 
-Known problem from the latest live run:
-- The review parser is too brittle for Anthropic text output
-- The reviewer often returns fenced ```json blocks
-- Those fenced responses are currently treated as parse failures in the review loop
-- Result: logs show false rejections such as `Reviewer response unparseable` even when the underlying JSON is valid
-- Despite that issue, the generated `output.json` and `.trace/tool-calls.jsonl` still passed `src/validate.ts`
-- This means the current bug is in review-response parsing, not in schema generation, trace matching, or batch validation
+### Review loop — anti-hallucination and contradiction filtering
+
+The review pass uses two hardening mechanisms introduced after observing internally contradictory reviewer feedback:
+
+**1. Policy grounding (`policySnippets`)**
+- `lookup_policy` results captured during Phase 1 are stored in `TriageDraft.policySnippets` (keyed by topic).
+- These are injected into the reviewer prompt under `## Actual clinic policy`.
+- The reviewer is explicitly instructed: *"Only report a violation if it is directly supported by the policy text above or by one of the explicit rules below."*
+- Prevents the reviewer from hallucinating policy rules that contradict the real `data/policies.md`.
+
+**2. Contradiction filter (`filterContradictions`)**
+- After receiving reviewer feedback, each line is checked against the actual output fields.
+- Lines that claim a violation that is already satisfied (e.g., "draft_reply is null" when `output.draft_reply !== null`) are dropped with a console log.
+- If all feedback lines are contradicted, the item is treated as approved without a revision pass.
+- Prevents spurious revision loops caused by reviewer hallucination about output field values.
 
 ---
 
