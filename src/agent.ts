@@ -33,8 +33,8 @@
  *   Phase 1  — Claude (claude-haiku-4-5-20251001) runs an agentic loop per item,
  *              calling the 3 tools above inside withItemContext() so every call
  *              lands in the audit trace.
- *   Review   — OpenAI (gpt-4o-mini) validates the output against clinic policies
- *              and returns structured feedback when rules are violated.
+ *   Review   — Claude validates the output against clinic policies and returns
+ *              structured feedback when rules are violated.
  *   Phase 2  — If rejected, Claude revises the output JSON using existing tool
  *              results as context. No new tool calls are made, so the trace
  *              stays clean: getToolCallsForItem() returns the same entries
@@ -42,7 +42,6 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import OpenAI from "openai";
 import {
   withItemContext,
   getToolCallsForItem,
@@ -57,10 +56,9 @@ import type { Assignee, Discipline, InboxItem, ItemOutput } from "./types.js";
 // ─── Clients ─────────────────────────────────────────────────────────────────
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const CLAUDE_MODEL = "claude-haiku-4-5-20251001";
-const OPENAI_MODEL = "gpt-4o-mini";
+const REVIEW_MODEL = "claude-haiku-4-5-20251001";
 const MAX_TOOL_ROUNDS = 10;
 const MAX_REVISIONS = 2;
 
@@ -462,7 +460,7 @@ async function reviseOutput(
   return revised;
 }
 
-// ─── OpenAI policy review ─────────────────────────────────────────────────────
+// ─── Anthropic policy review ──────────────────────────────────────────────────
 
 interface ReviewResult {
   approved: boolean;
@@ -493,21 +491,17 @@ Rules to enforce (check each one):
 10. decision_rationale must reference the key finding (insurance status, safeguarding signal, slot hold ID, etc.).
 `.trim();
 
-async function reviewWithOpenAI(
+async function reviewWithClaude(
   item: InboxItem,
   output: ItemOutput,
 ): Promise<ReviewResult> {
-  const response = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    temperature: 0,
-    response_format: { type: "json_object" },
+  const response = await anthropic.messages.create({
+    model: REVIEW_MODEL,
+    max_tokens: 1200,
+    system:
+      "You are a strict policy reviewer for a medical intake triage system. " +
+      "Check every rule. Return only valid JSON.",
     messages: [
-      {
-        role: "system",
-        content:
-          "You are a strict policy reviewer for a medical intake triage system. " +
-          "Check every rule. Return only valid JSON.",
-      },
       {
         role: "user",
         content: [
@@ -519,17 +513,23 @@ async function reviewWithOpenAI(
           "## Triage output",
           JSON.stringify(output, null, 2),
           "",
-          'Return ONLY: {"approved": true|false, "feedback": "<violations if any, else empty string>"}',
+          "Return a raw JSON object — no markdown fences, no explanation, no extra keys:",
+          '{"approved": true, "feedback": ""}',
+          "or",
+          '{"approved": false, "feedback": "<concise list of violated rules>"}',
         ].join("\n"),
       },
     ],
   });
 
+  const textBlock = response.content.find((block) => block.type === "text");
   const raw =
-    response.choices[0]?.message?.content ??
-    '{"approved":false,"feedback":"No reviewer response"}';
+    textBlock && textBlock.type === "text"
+      ? textBlock.text
+      : '{"approved":false,"feedback":"No reviewer response"}';
+
   try {
-    return JSON.parse(raw) as ReviewResult;
+    return JSON.parse(stripFences(raw)) as ReviewResult;
   } catch {
     return {
       approved: false,
@@ -550,7 +550,7 @@ async function processItem(item: InboxItem): Promise<ItemOutput> {
 
   // Review + revision loop (revision never makes new tool calls)
   for (let revision = 0; revision < MAX_REVISIONS; revision++) {
-    const review = await reviewWithOpenAI(item, output);
+    const review = await reviewWithClaude(item, output);
     const verdict = review.approved ? "✓ approved" : "✗ rejected";
     console.log(`  [${item.id}] review ${revision + 1}: ${verdict}`);
 
@@ -572,19 +572,29 @@ async function processItem(item: InboxItem): Promise<ItemOutput> {
   }
 
   // Final check after last revision
-  const final = await reviewWithOpenAI(item, output);
+  const final = await reviewWithClaude(item, output);
   console.log(
     `  [${item.id}] final: ${final.approved ? "✓ approved" : "✗ using last output"}`,
   );
   return output;
 }
 
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Remove markdown code fences that Claude sometimes wraps around JSON despite
+ * being told not to.  Handles ```json, ```JSON, ``` (plain), and leading/trailing
+ * whitespace.  Falls back to the original string if no fence is found.
+ */
+function stripFences(text: string): string {
+  const match = text.match(/^```(?:[a-zA-Z]*)?\s*([\s\S]*?)```\s*$/);
+  return match ? match[1].trim() : text.trim();
+}
+
 // ─── Output parser ────────────────────────────────────────────────────────────
 
 function parseItemOutput(text: string, itemId: string): ItemOutput {
-  // Strip markdown fences if Claude wrapped the JSON
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const jsonStr = fenced ? fenced[1].trim() : text;
+  const jsonStr = stripFences(text);
 
   try {
     const p = JSON.parse(jsonStr) as Partial<ItemOutput>;
