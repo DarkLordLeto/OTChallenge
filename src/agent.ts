@@ -1,7 +1,7 @@
 /**
  * Cedar Kids Therapy — Referral Inbox Triage Agent
  *
- * Selected tools (5 of 8):
+ * Selected tools (8 of 8):
  *   1. verify_insurance — result directly forks the workflow:
  *        in_network  → create intake task, proceed toward scheduling
  *        out_of_network / expired → create billing task, block slot hold
@@ -54,7 +54,7 @@
  *
  * Architecture:
  *   Phase 1  — Claude (claude-haiku-4-5-20251001) runs an agentic loop per item,
- *              calling the 3 tools above inside withItemContext() so every call
+ *              calling the tools above inside withItemContext() so every call
  *              lands in the audit trace.
  *   Review   — Claude validates the output against clinic policies and returns
  *              structured feedback when rules are violated.
@@ -89,7 +89,8 @@ const MAX_TOOL_ROUNDS = 10;
 const MAX_REVISIONS = 2;
 
 // ─── Tool definitions exposed to Claude ──────────────────────────────────────
-// 5 tools: verify_insurance, escalate, create_task, find_slots, hold_slot.
+// Tools exposed to the action model. These mirror the real mock tools in
+// src/tools.ts and define the boundary of what the model is allowed to do.
 
 const TOOL_DEFINITIONS: Anthropic.Tool[] = [
   {
@@ -353,10 +354,16 @@ Triage each referral inbox item. Use the available tools to gather information a
 - other: does not fit the above
 
 ## Urgency guide
-- P0: safeguarding / immediate risk → escalate required
-- P1: same-day operational issue → escalate required
-- P2: standard new referral or follow-up (1–2 business days)
-- P3: non-urgent inquiry or routine request
+- P0: safeguarding, imminent harm, or mandated-reporter situation → same-hour human review; escalate() required with severity "P0"
+- P1: same-day operational issue requiring prompt staff action (same-day cancel/reschedule, urgent scheduling gap) → escalate() required with severity "P1"
+- P2: normal intake, scheduling, billing, or clinical-review workflow (standard new referral, routine follow-up, OON insurance, incomplete paperwork, 1–2 business days)
+- P3: low-priority admin, FYI, or probable spam (no clinical or operational consequence if actioned next week)
+
+Calibration rules:
+  - Any safeguarding signal → P0, no exceptions.
+  - Same-day cancellation or reschedule → P1, no exceptions.
+  - New referrals, OON insurance, incomplete paperwork, clinical questions → P2.
+  - Routine admin with no patient impact → P3.
 
 ## Critical policies
 1. requires_human_review must always be true.
@@ -472,6 +479,8 @@ async function triageWithClaude(
   let draftReply: string | null = null;
   let escalationResult: { reason: string; severity: "P0" | "P1" } | null = null;
   const toolLog: string[] = [];
+  // Keep a per-topic cache of policy text actually retrieved during the action
+  // pass so the reviewer can be grounded in the same source material.
   const policySnippets: Record<string, string> = {};
 
   const userText = feedbackFromReviewer
@@ -499,7 +508,8 @@ async function triageWithClaude(
         textBlock && textBlock.type === "text" ? textBlock.text.trim() : "{}";
       const parsed = parseItemOutput(raw, item.id);
 
-      // Authoritative overrides from actual execution
+      // The model's self-reported JSON is not trusted for tool metadata.
+      // These fields are overwritten from the trace and captured tool state.
       parsed.tools_called = getToolCallsForItem(item.id);
       parsed.task_ids = taskIds;
       parsed.draft_reply = draftReply;
@@ -518,6 +528,8 @@ async function triageWithClaude(
     }
 
     if (response.stop_reason === "tool_use") {
+      // Feed tool results back to Claude in the format expected by Anthropic's
+      // tool-use loop so it can continue reasoning with actual outcomes.
       const results: Anthropic.ToolResultBlockParam[] = [];
 
       for (const block of response.content) {
@@ -667,6 +679,12 @@ Rules to enforce (check each one):
 9. task_ids must be non-empty (at least one task was created per item).
 10. decision_rationale must reference the key finding (insurance status, safeguarding signal, slot hold ID, etc.).
 11. draft_reply must not be null — a draft_message tool call must have been made for every item.
+12. URGENCY CALIBRATION — enforce the following tiers exactly:
+    P0: safeguarding / imminent harm / mandated-reporter — no other item type may use P0.
+    P1: same-day cancellation or reschedule — no other item type may use P1.
+    P2: new referral, OON insurance, incomplete paperwork, clinical question, routine follow-up.
+    P3: low-priority admin, FYI, or probable spam with no clinical or operational consequence.
+    Flag any item where the urgency does not match its classification.
 `.trim();
 
 async function reviewWithClaude(
@@ -834,7 +852,8 @@ async function processItem(item: InboxItem): Promise<ItemOutput> {
 
   let output = draft.output;
 
-  // Review + revision loop (revision never makes new tool calls)
+  // Review + revision loop. Revisions are text-only and must preserve the
+  // authoritative tool trace from Phase 1.
   for (let revision = 0; revision < MAX_REVISIONS; revision++) {
     const review = await reviewWithClaude(item, output, draft.policySnippets);
     const verdict = review.approved ? "✓ approved" : "✗ rejected";
