@@ -1,15 +1,35 @@
 /**
  * Cedar Kids Therapy — Referral Inbox Triage Agent
  *
+ * Selected tools (3 of 8):
+ *   1. verify_insurance — result directly forks the workflow:
+ *        in_network  → create intake task, proceed toward scheduling
+ *        out_of_network / expired → create billing task, block slot hold
+ *        Used for every item that includes payer information (items 1, 3, 4, 7).
+ *
+ *   2. escalate — required by policy for P0 / P1 items:
+ *        P0: any safeguarding signal (harm / abuse / neglect) → clinical_lead, same hour
+ *        P1: same-day cancellation or reschedule → front_desk, immediate
+ *        Used for items 2 (safeguarding) and 8 (same-day reschedule).
+ *
+ *   3. create_task — assigns concrete follow-up work to the right staff member;
+ *        always driven by verify_insurance result or classification:
+ *        billing      → out-of-network insurance
+ *        clinical_lead → safeguarding escalations
+ *        intake       → new referrals ready to proceed
+ *        front_desk   → scheduling changes, missing-info follow-ups
+ *        Used for all 8 items — the assignee and notes reflect the triage decision.
+ *
  * Architecture:
- *  1. Claude (claude-haiku-4-5-20251001) runs the agentic triage loop for each item:
- *     - Calls real tool implementations in tools.ts (recorded in trace automatically)
- *     - Produces a structured ItemOutput JSON
- *  2. OpenAI (gpt-4o-mini) reviews the output against clinic policies
- *  3. If OpenAI rejects the output, it sends feedback back to Claude for a revision pass
- *     - Revision pass shares the original tool results as context (no new tool calls)
- *     - This keeps the trace clean: tools are only called once per item
- *  4. After MAX_REVIEW_RETRIES, the last produced output is used regardless
+ *   Phase 1  — Claude (claude-haiku-4-5-20251001) runs an agentic loop per item,
+ *              calling the 3 tools above inside withItemContext() so every call
+ *              lands in the audit trace.
+ *   Review   — OpenAI (gpt-4o-mini) validates the output against clinic policies
+ *              and returns structured feedback when rules are violated.
+ *   Phase 2  — If rejected, Claude revises the output JSON using existing tool
+ *              results as context. No new tool calls are made, so the trace
+ *              stays clean: getToolCallsForItem() returns the same entries
+ *              both before and after revision.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -17,22 +37,11 @@ import OpenAI from "openai";
 import {
   withItemContext,
   getToolCallsForItem,
-  search_patient,
   verify_insurance,
-  lookup_policy,
-  find_slots,
-  hold_slot,
-  create_task,
-  draft_message,
   escalate,
+  create_task,
 } from "./tools.js";
-import type {
-  Assignee,
-  Discipline,
-  InboxItem,
-  ItemOutput,
-  PolicyTopic,
-} from "./types.js";
+import type { Assignee, InboxItem, ItemOutput } from "./types.js";
 
 // ─── Clients ─────────────────────────────────────────────────────────────────
 
@@ -41,107 +50,65 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const CLAUDE_MODEL = "claude-haiku-4-5-20251001";
 const OPENAI_MODEL = "gpt-4o-mini";
-const MAX_REVIEW_RETRIES = 2; // OpenAI can reject and re-prompt Claude up to this many times
-const MAX_TOOL_ROUNDS = 12;   // safety cap on the agentic loop per item
+const MAX_TOOL_ROUNDS = 10;
+const MAX_REVISIONS = 2;
 
-// ─── Tool definitions for Claude API ─────────────────────────────────────────
+// ─── Tool definitions exposed to Claude ──────────────────────────────────────
+// Only the 3 chosen tools. Claude cannot call any other tool.
 
 const TOOL_DEFINITIONS: Anthropic.Tool[] = [
   {
-    name: "search_patient",
-    description:
-      "Search for existing patients by name and/or date of birth. Use for any item that mentions a patient by name.",
-    input_schema: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "Full or partial patient name" },
-        dob: {
-          type: "string",
-          description: "Date of birth in YYYY-MM-DD format",
-        },
-      },
-    },
-  },
-  {
     name: "verify_insurance",
-    description:
-      "Verify a patient's insurance coverage. Returns in_network, out_of_network, expired, or unknown.",
+    description: [
+      "Verify a patient's insurance coverage against Cedar Kids Therapy's network.",
+      "Returns: in_network | out_of_network | expired | unknown.",
+      "ALWAYS call this for any item that contains payer or member_id information.",
+      "The result determines the follow-up path:",
+      "  in_network  → create an intake task for scheduling workflow",
+      "  out_of_network / expired → create a billing task; do NOT recommend hold_slot",
+      "  unknown     → create a billing task to verify manually",
+    ].join(" "),
     input_schema: {
       type: "object",
       properties: {
-        payer: { type: "string", description: "Insurance payer name" },
-        member_id: { type: "string", description: "Member ID from insurance card" },
+        payer: { type: "string", description: "Insurance payer name from the item" },
+        member_id: { type: "string", description: "Member ID from the item" },
       },
     },
   },
   {
-    name: "lookup_policy",
-    description: "Retrieve clinic policy snippets by topic.",
+    name: "escalate",
+    description: [
+      "Flag an item for immediate human oversight.",
+      "REQUIRED for:",
+      "  P0 — any mention of harm, abuse, neglect, or unsafe caregiving (safeguarding)",
+      "  P1 — same-day cancellation or reschedule request",
+      "Always follow escalate() with a create_task() assigned to the appropriate staff.",
+    ].join(" "),
     input_schema: {
       type: "object",
-      required: ["topic"],
+      required: ["item_id", "reason", "severity"],
       properties: {
-        topic: {
+        item_id: { type: "string", description: "Inbox item ID" },
+        reason: { type: "string", description: "Concise reason for escalation" },
+        severity: {
           type: "string",
-          enum: [
-            "service_lines",
-            "insurance",
-            "safeguarding",
-            "clinical_advice",
-            "scheduling",
-            "cancellation",
-            "language_access",
-          ],
-          description: "Policy topic to look up",
-        },
-      },
-    },
-  },
-  {
-    name: "find_slots",
-    description:
-      "Search available appointment slots. Only use when insurance is in-network and intake data is complete.",
-    input_schema: {
-      type: "object",
-      properties: {
-        discipline: {
-          type: "string",
-          enum: ["SLP", "OT", "PT"],
-          description: "Therapy discipline",
-        },
-        preferences: {
-          type: "string",
-          description: "Scheduling preferences (e.g. mornings, after school)",
-        },
-        language: {
-          type: "string",
-          description: "Language preference code (e.g. 'es' for Spanish)",
-        },
-      },
-    },
-  },
-  {
-    name: "hold_slot",
-    description:
-      "Reserve a slot in pending_review status. ONLY call when insurance is confirmed in-network AND intake is complete. This does NOT confirm an appointment.",
-    input_schema: {
-      type: "object",
-      required: ["slot_id", "patient_ref"],
-      properties: {
-        slot_id: {
-          type: "string",
-          description: "Slot ID returned by find_slots",
-        },
-        patient_ref: {
-          type: "string",
-          description: "Patient name or ID for reference",
+          enum: ["P0", "P1"],
+          description: "P0 = safeguarding/immediate risk; P1 = same-day operational",
         },
       },
     },
   },
   {
     name: "create_task",
-    description: "Create a follow-up task for clinic staff.",
+    description: [
+      "Create a staff follow-up task. Always call this to assign concrete next steps.",
+      "Choose assignee based on situation:",
+      "  clinical_lead → safeguarding escalations",
+      "  billing       → out-of-network or unknown insurance, benefits conversations",
+      "  intake        → new referrals ready to proceed, missing-info follow-ups",
+      "  front_desk    → scheduling changes, general parent communication",
+    ].join(" "),
     input_schema: {
       type: "object",
       required: ["assignee", "title", "due", "notes"],
@@ -150,90 +117,58 @@ const TOOL_DEFINITIONS: Anthropic.Tool[] = [
           type: "string",
           enum: ["front_desk", "intake", "billing", "clinical_lead"],
         },
-        title: { type: "string" },
-        due: { type: "string", description: "Due date in YYYY-MM-DD format" },
-        notes: { type: "string", description: "Detailed task notes" },
-      },
-    },
-  },
-  {
-    name: "draft_message",
-    description:
-      "Compose an outbound message draft. Message stays in draft state — it is never sent automatically.",
-    input_schema: {
-      type: "object",
-      required: ["recipient", "channel", "body"],
-      properties: {
-        recipient: { type: "string" },
-        channel: { type: "string", enum: ["portal", "email", "phone"] },
-        body: { type: "string" },
-        language: { type: "string", enum: ["en", "es"] },
-      },
-    },
-  },
-  {
-    name: "escalate",
-    description:
-      "Flag an item for immediate human oversight. Required for P0 (safeguarding, immediate risk) and P1 (same-day operational issues).",
-    input_schema: {
-      type: "object",
-      required: ["item_id", "reason", "severity"],
-      properties: {
-        item_id: { type: "string" },
-        reason: { type: "string" },
-        severity: { type: "string", enum: ["P0", "P1"] },
+        title: { type: "string", description: "Short task title (1 line)" },
+        due: { type: "string", description: "Due date YYYY-MM-DD" },
+        notes: {
+          type: "string",
+          description: "Detailed notes including patient name, key findings, and action required",
+        },
       },
     },
   },
 ];
 
-// ─── System prompt for Claude ─────────────────────────────────────────────────
+// ─── System prompt ────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a medical intake triage agent for Cedar Kids Therapy, a pediatric therapy practice serving children ages 0–18.
+const SYSTEM_PROMPT = `You are a medical intake triage agent for Cedar Kids Therapy, a pediatric therapy practice for children ages 0–18.
 
 ## Your task
-For each inbox item, use the provided tools to gather relevant information, then produce a single JSON object (ItemOutput) that captures your triage decision.
+Triage each referral inbox item. Use the 3 available tools to gather information and create follow-up tasks, then output a structured JSON triage record.
+
+## Tool usage rules
+- verify_insurance: call for EVERY item that includes payer or member_id. Use the result to decide the next action (in_network → intake; out_of_network → billing).
+- escalate: REQUIRED for safeguarding signals (P0) and same-day cancellations/reschedules (P1). Must be called before create_task for those items.
+- create_task: call for EVERY item to assign concrete staff follow-up. Assignee must match the situation. Always include patient name and relevant details in notes.
+
+## Classification guide
+- new_referral: complete or partial referral for a new evaluation
+- existing_patient_request: request from a known patient family
+- scheduling: cancellation, reschedule, appointment change
+- clinical_question: parent asking for clinical advice or developmental info
+- billing_question: insurance or payment inquiry
+- missing_paperwork: referral with missing required fields
+- safeguarding: any disclosure of harm, abuse, neglect, or unsafe caregiving
+- other: does not fit the above
+
+## Urgency guide
+- P0: safeguarding / immediate risk → escalate required
+- P1: same-day operational issue → escalate required
+- P2: standard new referral or follow-up (1–2 business days)
+- P3: non-urgent inquiry or routine request
 
 ## Critical policies
-1. SAFEGUARDING — any mention of harm, abuse, neglect, or unsafe caregiving:
-   - classification: "safeguarding", urgency: "P0"
-   - MUST call escalate() with severity "P0"
-   - draft_reply must be a neutral acknowledgement only — no investigative advice
-2. SAME-DAY CANCELLATION / RESCHEDULE:
-   - classification: "scheduling", urgency: "P1"
-   - MUST call escalate() with severity "P1"
-3. OUT-OF-NETWORK insurance (Kaiser, Cigna Select, Beacon):
-   - call verify_insurance() + lookup_policy({topic:"insurance"})
-   - create_task() for billing team to discuss benefits
-   - DO NOT call hold_slot() — slot holds require a benefits conversation first
-4. IN-NETWORK payers: Aetna, Blue Cross Blue Shield, UnitedHealthcare, Medicaid
-5. CLINICAL QUESTIONS:
-   - classification: "clinical_question"
-   - NEVER provide clinical advice in draft_reply; route to clinician or screening
-6. INCOMPLETE REFERRALS:
-   - classification: "missing_paperwork"
-   - list every missing field in missing_info[]
-7. SPANISH-SPEAKING FAMILIES:
-   - call find_slots() with language:"es"
-   - draft_reply in Spanish
-8. requires_human_review MUST always be true
-9. FORBIDDEN: never call schedule_appointment or send_message
-
-## Tool guidelines
-- search_patient() — use for existing/reschedule patients when name+DOB available
-- verify_insurance() — use for any item with payer info
-- lookup_policy() — use when policy context needed (safeguarding, insurance, clinical_advice, etc.)
-- find_slots() — use for new referrals after confirming in-network insurance
-- hold_slot() — only for in-network + complete intake; always pending_review
-- create_task() — assign follow-ups to appropriate staff
-- draft_message() — compose outbound replies (stays draft)
-- escalate() — required for P0 and P1
+1. requires_human_review must always be true.
+2. Out-of-network insurance (Kaiser, Cigna Select, Beacon): do NOT recommend hold_slot; billing must discuss benefits first.
+3. Clinical questions: do NOT provide clinical advice in draft_reply; route to clinician review.
+4. Safeguarding: draft_reply must be neutral acknowledgement only — no investigative content.
+5. Spanish-speaking families: draft_reply in Spanish when possible.
+6. FORBIDDEN: never call schedule_appointment or send_message.
 
 ## Output format
-After using tools, respond with ONLY a raw JSON object (no markdown fences, no explanation):
+After finishing tool calls, respond with ONLY a raw JSON object (no markdown fences):
 {
-  "item_id": "<from input>",
-  "classification": "<see enum>",
+  "item_id": "<from item>",
+  "classification": "<see guide>",
   "urgency": "P0|P1|P2|P3",
   "requires_human_review": true,
   "extracted_intake": {
@@ -245,82 +180,71 @@ After using tools, respond with ONLY a raw JSON object (no markdown fences, no e
     "payer": "<string or null>",
     "member_id": "<string or null>"
   },
-  "missing_info": [],
+  "missing_info": ["<field name>", ...],
   "tools_called": [],
-  "recommended_next_action": "<string>",
-  "draft_reply": "<string or null>",
+  "recommended_next_action": "<one clear sentence>",
+  "draft_reply": "<message text or null>",
   "task_ids": [],
-  "escalation": {"reason":"<string>","severity":"P0|P1"} or null,
-  "decision_rationale": "<string>"
+  "escalation": {"reason": "<string>", "severity": "P0|P1"} or null,
+  "decision_rationale": "<2–3 sentences explaining classification, urgency, and key findings>"
 }
-Leave tools_called and task_ids as empty arrays — they will be populated from the execution trace.`;
+Leave tools_called and task_ids empty — they are populated from the execution trace.`;
 
 // ─── Tool dispatcher ──────────────────────────────────────────────────────────
 
 type ToolInput = Record<string, unknown>;
 
-async function executeTool(
+interface DispatchResult {
+  data: unknown;
+  result_summary: string;
+}
+
+async function dispatchTool(
   name: string,
   input: ToolInput,
-): Promise<{ data: unknown; result_summary: string }> {
+): Promise<DispatchResult> {
   switch (name) {
-    case "search_patient":
-      return search_patient(input as { name?: string; dob?: string });
     case "verify_insurance":
-      return verify_insurance(input as { payer?: string; member_id?: string });
-    case "lookup_policy":
-      return lookup_policy(input as { topic: PolicyTopic });
-    case "find_slots":
-      return find_slots(
-        input as { discipline?: Discipline; preferences?: string; language?: string },
-      );
-    case "hold_slot":
-      return hold_slot(input as { slot_id: string; patient_ref: string });
-    case "create_task":
-      return create_task(
-        input as { assignee: Assignee; title: string; due: string; notes: string },
-      );
-    case "draft_message":
-      return draft_message(
-        input as {
-          recipient: string;
-          channel: "portal" | "email" | "phone";
-          body: string;
-          language?: "en" | "es";
-        },
+      return verify_insurance(
+        input as { payer?: string; member_id?: string },
       );
     case "escalate":
       return escalate(
         input as { item_id: string; reason: string; severity: "P0" | "P1" },
       );
+    case "create_task":
+      return create_task(
+        input as { assignee: Assignee; title: string; due: string; notes: string },
+      );
     default:
-      throw new Error(`Unknown tool: ${name}`);
+      throw new Error(`Tool not available in this agent: ${name}`);
   }
 }
 
 // ─── Phase 1: Claude agentic triage loop ──────────────────────────────────────
 
-interface TriageRun {
+interface TriageDraft {
   output: ItemOutput;
   taskIds: string[];
   escalationResult: { reason: string; severity: "P0" | "P1" } | null;
-  toolSummaryLines: string[]; // human-readable tool call log for revision context
+  /** Plain-text log of tool calls for use in revision prompts */
+  toolLog: string[];
 }
 
 async function triageWithClaude(
   item: InboxItem,
-  priorFeedback: string | null,
-): Promise<TriageRun> {
+  feedbackFromReviewer: string | null,
+): Promise<TriageDraft> {
   const taskIds: string[] = [];
   let escalationResult: { reason: string; severity: "P0" | "P1" } | null = null;
-  const toolSummaryLines: string[] = [];
+  const toolLog: string[] = [];
 
-  const userMessage = priorFeedback
-    ? `Triage this inbox item. A previous attempt was rejected by the quality reviewer:\n<feedback>\n${priorFeedback}\n</feedback>\n\nPlease fix these issues.\n\nInbox item:\n${JSON.stringify(item, null, 2)}`
+  const userText = feedbackFromReviewer
+    ? `Triage the inbox item below. A quality reviewer rejected a previous attempt — fix all issues listed.\n\n<reviewer_feedback>\n${feedbackFromReviewer}\n</reviewer_feedback>\n\nInbox item:\n${JSON.stringify(item, null, 2)}`
     : `Triage this inbox item:\n${JSON.stringify(item, null, 2)}`;
 
   const messages: Anthropic.MessageParam[] = [
-    { role: "user", content: userMessage },
+    { role: "user", content: userText },
   ];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -334,167 +258,159 @@ async function triageWithClaude(
 
     messages.push({ role: "assistant", content: response.content });
 
-    // Claude finished — parse its JSON output
     if (response.stop_reason === "end_turn") {
       const textBlock = response.content.find((c) => c.type === "text");
-      const rawText =
+      const raw =
         textBlock && textBlock.type === "text" ? textBlock.text.trim() : "{}";
+      const parsed = parseItemOutput(raw, item.id);
 
-      const parsed = parseItemOutput(rawText, item.id);
-
-      // Authoritative sources override Claude's self-reported values
+      // Authoritative overrides from actual execution
       parsed.tools_called = getToolCallsForItem(item.id);
       parsed.task_ids = taskIds;
       parsed.escalation = escalationResult;
       parsed.requires_human_review = true;
 
-      return { output: parsed, taskIds, escalationResult, toolSummaryLines };
+      return { output: parsed, taskIds, escalationResult, toolLog };
     }
 
-    // Claude made tool calls — execute them and feed results back
     if (response.stop_reason === "tool_use") {
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      const results: Anthropic.ToolResultBlockParam[] = [];
 
       for (const block of response.content) {
         if (block.type !== "tool_use") continue;
 
-        let resultContent: string;
+        let content: string;
         try {
-          const result = await executeTool(
+          const result = await dispatchTool(
             block.name,
             block.input as ToolInput,
           );
 
-          // Track task IDs and escalations from tool results
           if (block.name === "create_task") {
-            const d = result.data as { task_id: string };
-            taskIds.push(d.task_id);
+            taskIds.push((result.data as { task_id: string }).task_id);
           }
           if (block.name === "escalate") {
-            const inp = block.input as { reason: string; severity: "P0" | "P1" };
-            escalationResult = { reason: inp.reason, severity: inp.severity };
+            const inp = block.input as {
+              reason: string;
+              severity: "P0" | "P1";
+            };
+            escalationResult = {
+              reason: inp.reason,
+              severity: inp.severity,
+            };
           }
 
-          resultContent = JSON.stringify(result.data);
-          toolSummaryLines.push(
+          content = JSON.stringify(result.data);
+          toolLog.push(
             `${block.name}(${JSON.stringify(block.input)}) → ${result.result_summary}`,
           );
         } catch (err) {
-          resultContent = `Error: ${err instanceof Error ? err.message : String(err)}`;
-          toolSummaryLines.push(`${block.name} → ERROR: ${resultContent}`);
+          content = `Error: ${err instanceof Error ? err.message : String(err)}`;
+          toolLog.push(`${block.name} → ERROR: ${content}`);
         }
 
-        toolResults.push({
+        results.push({
           type: "tool_result",
           tool_use_id: block.id,
-          content: resultContent,
+          content,
         });
       }
 
-      messages.push({ role: "user", content: toolResults });
+      messages.push({ role: "user", content: results });
     }
   }
 
-  throw new Error(`Max tool rounds (${MAX_TOOL_ROUNDS}) exceeded for ${item.id}`);
+  throw new Error(`Max tool rounds exceeded for ${item.id}`);
 }
 
-// ─── Phase 2: Claude revision (no new tool calls) ─────────────────────────────
+// ─── Phase 2: revision without new tool calls ─────────────────────────────────
 
-async function reviseWithClaude(
+async function reviseOutput(
   item: InboxItem,
-  previousOutput: ItemOutput,
-  toolSummaryLines: string[],
+  previous: ItemOutput,
+  toolLog: string[],
   feedback: string,
 ): Promise<ItemOutput> {
   const toolContext =
-    toolSummaryLines.length > 0
-      ? `Tool calls already executed for this item:\n${toolSummaryLines.join("\n")}`
-      : "No tools were called in the previous attempt.";
+    toolLog.length > 0
+      ? `Tool calls already made for this item:\n${toolLog.join("\n")}`
+      : "No tools were called.";
 
-  const messages: Anthropic.MessageParam[] = [
-    {
-      role: "user",
-      content: `Revise your triage output based on reviewer feedback. Do NOT call any tools — use the results already gathered.
-
-Inbox item:
-${JSON.stringify(item, null, 2)}
-
-${toolContext}
-
-Your previous output:
-${JSON.stringify(previousOutput, null, 2)}
-
-Reviewer feedback (issues to correct):
-${feedback}
-
-Respond with ONLY the corrected JSON object.`,
-    },
-  ];
-
-  // No tools passed — Claude cannot call any tools in this pass
+  // No tools passed — Claude produces text only in this pass
   const response = await anthropic.messages.create({
     model: CLAUDE_MODEL,
     max_tokens: 4096,
     system: SYSTEM_PROMPT,
-    messages,
+    messages: [
+      {
+        role: "user",
+        content: [
+          `Revise the triage output below to fix the reviewer's feedback.`,
+          `Do NOT call any tools — use the results already captured.`,
+          ``,
+          `Inbox item:`,
+          JSON.stringify(item, null, 2),
+          ``,
+          toolContext,
+          ``,
+          `Previous output:`,
+          JSON.stringify(previous, null, 2),
+          ``,
+          `Reviewer feedback (all issues must be fixed):`,
+          feedback,
+          ``,
+          `Respond with ONLY the corrected JSON object.`,
+        ].join("\n"),
+      },
+    ],
   });
 
   const textBlock = response.content.find((c) => c.type === "text");
-  const rawText =
+  const raw =
     textBlock && textBlock.type === "text" ? textBlock.text.trim() : "{}";
+  const revised = parseItemOutput(raw, item.id);
 
-  const revised = parseItemOutput(rawText, item.id);
-
-  // Keep authoritative values from the original triage run
-  revised.tools_called = previousOutput.tools_called;
-  revised.task_ids = previousOutput.task_ids;
-  revised.escalation = previousOutput.escalation ?? revised.escalation;
+  // tools_called, task_ids, and escalation come from Phase 1 and never change
+  revised.tools_called = previous.tools_called;
+  revised.task_ids = previous.task_ids;
+  revised.escalation = previous.escalation ?? revised.escalation;
   revised.requires_human_review = true;
 
   return revised;
 }
 
-// ─── OpenAI review ────────────────────────────────────────────────────────────
+// ─── OpenAI policy review ─────────────────────────────────────────────────────
 
 interface ReviewResult {
   approved: boolean;
   feedback: string;
 }
 
+const REVIEW_RULES = `
+Rules to enforce (check each one):
+1. SAFEGUARDING — if the item body mentions harm, abuse, neglect, or unsafe caregiving:
+   classification must be "safeguarding", urgency must be "P0",
+   escalation must not be null and severity must be "P0".
+2. SAME-DAY RESCHEDULE/CANCELLATION — classification "scheduling", urgency "P1",
+   escalation must not be null, severity "P1".
+3. OUT-OF-NETWORK insurance (Kaiser, Cigna Select, Beacon):
+   tools_called must include verify_insurance;
+   recommended_next_action must NOT suggest hold_slot or scheduling.
+4. CLINICAL QUESTION — classification "clinical_question";
+   draft_reply must NOT contain clinical advice or developmental assessments.
+5. INCOMPLETE REFERRAL — classification "missing_paperwork";
+   missing_info must list every blank field.
+6. requires_human_review must be true.
+7. escalation must not be null for P0 or P1 items.
+8. tools_called must be non-empty (at least one tool was called).
+9. task_ids must be non-empty (at least one task was created per item).
+10. decision_rationale must reference the key finding (insurance status, safeguarding signal, etc.).
+`.trim();
+
 async function reviewWithOpenAI(
   item: InboxItem,
   output: ItemOutput,
 ): Promise<ReviewResult> {
-  const prompt = `You are a strict quality reviewer for a medical intake triage system at Cedar Kids Therapy.
-
-Check the triage output against these rules and return JSON only.
-
-## Rules
-1. SAFEGUARDING: if the item body mentions harm, abuse, neglect, or unsafe caregiving →
-   - classification must be "safeguarding", urgency must be "P0"
-   - escalation must not be null and severity must be "P0"
-2. SAME-DAY RESCHEDULE/CANCELLATION → classification "scheduling", urgency "P1", escalation severity "P1"
-3. OUT-OF-NETWORK insurance (Kaiser, Cigna Select, Beacon) →
-   - tools_called must include verify_insurance AND lookup_policy
-   - tools_called must NOT include hold_slot
-   - task_ids must be non-empty (billing task required)
-4. CLINICAL QUESTION → classification "clinical_question"; draft_reply must NOT give clinical advice
-5. INCOMPLETE REFERRAL → classification "missing_paperwork"; missing_info must list all missing fields
-6. SPANISH-SPEAKING → draft_reply should be in Spanish
-7. requires_human_review must be true
-8. escalation must not be null for P0 or P1 items
-9. At least one tool must appear in tools_called
-10. task_ids must contain IDs that look like real IDs (starting with "task_"), not empty for referral items
-
-## Inbox item
-${JSON.stringify(item, null, 2)}
-
-## Triage output
-${JSON.stringify(output, null, 2)}
-
-Respond ONLY with this JSON (no other text):
-{"approved": true|false, "feedback": "<if not approved: list specific violations; if approved: empty string>"}`;
-
   const response = await openai.chat.completions.create({
     model: OPENAI_MODEL,
     temperature: 0,
@@ -503,80 +419,86 @@ Respond ONLY with this JSON (no other text):
       {
         role: "system",
         content:
-          "You are a strict quality reviewer. Respond only with valid JSON matching the requested format.",
+          "You are a strict policy reviewer for a medical intake triage system. " +
+          "Check every rule. Return only valid JSON.",
       },
-      { role: "user", content: prompt },
+      {
+        role: "user",
+        content: [
+          REVIEW_RULES,
+          "",
+          "## Inbox item",
+          JSON.stringify(item, null, 2),
+          "",
+          "## Triage output",
+          JSON.stringify(output, null, 2),
+          "",
+          'Return ONLY: {"approved": true|false, "feedback": "<violations if any, else empty string>"}',
+        ].join("\n"),
+      },
     ],
   });
 
-  const content =
+  const raw =
     response.choices[0]?.message?.content ??
-    '{"approved":false,"feedback":"No response from reviewer"}';
-
+    '{"approved":false,"feedback":"No reviewer response"}';
   try {
-    return JSON.parse(content) as ReviewResult;
+    return JSON.parse(raw) as ReviewResult;
   } catch {
     return {
       approved: false,
-      feedback: `Reviewer response could not be parsed: ${content.slice(0, 200)}`,
+      feedback: `Reviewer response unparseable: ${raw.slice(0, 200)}`,
     };
   }
 }
 
-// ─── Orchestration: triage + review + optional revision ───────────────────────
+// ─── Per-item orchestration ───────────────────────────────────────────────────
 
-async function processItemWithReview(item: InboxItem): Promise<ItemOutput> {
-  // Phase 1 — full agentic run with tool calls (inside withItemContext for trace)
-  let triageRun = await withItemContext(item.id, () =>
+async function processItem(item: InboxItem): Promise<ItemOutput> {
+  // Phase 1 — agentic triage with tool calls recorded in trace
+  const draft = await withItemContext(item.id, () =>
     triageWithClaude(item, null),
   );
 
-  let output = triageRun.output;
+  let output = draft.output;
 
-  for (let attempt = 0; attempt < MAX_REVIEW_RETRIES; attempt++) {
+  // Review + revision loop (revision never makes new tool calls)
+  for (let revision = 0; revision < MAX_REVISIONS; revision++) {
     const review = await reviewWithOpenAI(item, output);
-    const status = review.approved ? "✓ approved" : "✗ rejected";
-    console.log(`  [${item.id}] review attempt ${attempt + 1}: ${status}`);
+    const verdict = review.approved ? "✓ approved" : "✗ rejected";
+    console.log(`  [${item.id}] review ${revision + 1}: ${verdict}`);
 
     if (review.approved) return output;
 
     console.log(`  [${item.id}] feedback: ${review.feedback}`);
 
-    if (attempt === 0 && !review.approved) {
-      // First rejection: re-run triage with feedback so Claude can also re-use tools
-      // (subsequent rejections use revision without new tool calls)
-      triageRun = await withItemContext(item.id, () =>
-        triageWithClaude(item, review.feedback),
-      );
-      output = triageRun.output;
-    } else {
-      // Subsequent rejections: revision only — no new tool calls, keeps trace clean
-      output = await reviseWithClaude(
-        item,
-        output,
-        triageRun.toolSummaryLines,
-        review.feedback,
-      );
-    }
+    output = await reviseOutput(
+      item,
+      output,
+      draft.toolLog,
+      review.feedback,
+    );
+    // Ensure authoritative trace values are preserved after revision
+    output.tools_called = getToolCallsForItem(item.id);
+    output.task_ids = draft.taskIds;
+    output.escalation = draft.escalationResult;
+    output.requires_human_review = true;
   }
 
-  // Final review after last revision
-  const finalReview = await reviewWithOpenAI(item, output);
+  // Final check after last revision
+  const final = await reviewWithOpenAI(item, output);
   console.log(
-    `  [${item.id}] final review: ${finalReview.approved ? "✓ approved" : "✗ using last output anyway"}`,
+    `  [${item.id}] final: ${final.approved ? "✓ approved" : "✗ using last output"}`,
   );
-
   return output;
 }
 
-// ─── JSON parser ──────────────────────────────────────────────────────────────
+// ─── Output parser ────────────────────────────────────────────────────────────
 
 function parseItemOutput(text: string, itemId: string): ItemOutput {
-  let jsonStr = text;
-
-  // Strip markdown code fences if present
-  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenceMatch) jsonStr = fenceMatch[1].trim();
+  // Strip markdown fences if Claude wrapped the JSON
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const jsonStr = fenced ? fenced[1].trim() : text;
 
   try {
     const p = JSON.parse(jsonStr) as Partial<ItemOutput>;
@@ -597,12 +519,12 @@ function parseItemOutput(text: string, itemId: string): ItemOutput {
       missing_info: p.missing_info ?? [],
       tools_called: [],
       recommended_next_action:
-        p.recommended_next_action ?? "Manual review required.",
+        p.recommended_next_action ?? "Requires manual review.",
       draft_reply: p.draft_reply ?? null,
-      task_ids: p.task_ids ?? [],
+      task_ids: [],
       escalation: p.escalation ?? null,
       decision_rationale:
-        p.decision_rationale ?? "Agent output — see tools_called for details.",
+        p.decision_rationale ?? "See tools_called for decision details.",
     };
   } catch {
     return {
@@ -621,11 +543,12 @@ function parseItemOutput(text: string, itemId: string): ItemOutput {
       },
       missing_info: ["agent_output_parse_error"],
       tools_called: [],
-      recommended_next_action: "Manual review required — could not parse agent output.",
+      recommended_next_action:
+        "Manual review required — agent output could not be parsed.",
       draft_reply: null,
       task_ids: [],
       escalation: null,
-      decision_rationale: `Parse error. Raw output: ${text.slice(0, 300)}`,
+      decision_rationale: `Parse error. Raw: ${text.slice(0, 300)}`,
     };
   }
 }
@@ -633,18 +556,18 @@ function parseItemOutput(text: string, itemId: string): ItemOutput {
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 export async function runAgent(inbox: InboxItem[]): Promise<ItemOutput[]> {
-  console.log(`\nStarting triage for ${inbox.length} inbox items...\n`);
+  console.log(`\nTriaging ${inbox.length} inbox items...\n`);
   const results: ItemOutput[] = [];
 
   for (const item of inbox) {
-    console.log(`Processing [${item.id}]: ${item.subject}`);
-    const output = await processItemWithReview(item);
-    results.push(output);
+    console.log(`[${item.id}] ${item.subject}`);
+    const output = await processItem(item);
     console.log(
-      `  → classification: ${output.classification} | urgency: ${output.urgency} | tools: ${output.tools_called.length}\n`,
+      `  → ${output.classification} | ${output.urgency} | ` +
+        `tools: ${output.tools_called.length} | tasks: ${output.task_ids.length}\n`,
     );
+    results.push(output);
   }
 
-  console.log("Triage complete.\n");
   return results;
 }

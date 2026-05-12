@@ -84,16 +84,18 @@ Dual-LLM single-agent pipeline. Claude performs triage with tool use; OpenAI act
 
 ## Tools & Capabilities
 
-| Tool | Purpose | Assignee / Notes |
-|------|---------|-----------------|
-| `search_patient` | Look up existing patients by name/DOB | Returns active/inactive status |
-| `verify_insurance` | Check payer network status | in_network / out_of_network / expired / unknown |
-| `lookup_policy` | Retrieve clinic policy snippets by topic | 7 topics available |
-| `find_slots` | Search available appointment slots | Filters by discipline, language |
-| `hold_slot` | Reserve a slot pending human review | Status always `pending_review` — NOT a confirmed booking |
-| `create_task` | Log action items for staff | Assignees: front_desk, intake, billing, clinical_lead |
-| `draft_message` | Compose outbound messages | Stays in draft state — never sent automatically |
-| `escalate` | Flag items for immediate human oversight | P0 or P1 severity |
+8 tools are available in `src/tools.ts`. The agent uses **3** — chosen because each is a real decision input, not a threshold filler.
+
+| Tool | Used? | Role in decision process | Items |
+|------|-------|--------------------------|-------|
+| `verify_insurance` | **Yes** | Result forks the workflow: in-network → intake task; out-of-network → billing task, no slot hold | 1, 3, 4, 7 |
+| `escalate` | **Yes** | Required by policy for P0 (safeguarding) and P1 (same-day changes); produces escalation_id | 2, 8 |
+| `create_task` | **Yes** | Creates concrete staff follow-up; assignee (billing/intake/clinical_lead/front_desk) reflects triage decision | 1–8 |
+| `search_patient` | No | Not selected — patient lookup not needed for first-contact triage of these 8 items | — |
+| `lookup_policy` | No | Not selected — policies are encoded in the system prompt; runtime lookups would be performative | — |
+| `find_slots` | No | Not selected — out-of-network items block slot holds; no item is fully cleared for hold in this batch | — |
+| `hold_slot` | No | Not selected — slot reservation requires billing clearance not yet done for any item | — |
+| `draft_message` | No | Not selected — outbound messages are represented in `draft_reply` field; extra tool call would duplicate that | — |
 
 **Forbidden tools (must never appear in output or trace):** `schedule_appointment`, `send_message`
 
