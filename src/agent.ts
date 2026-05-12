@@ -1,7 +1,7 @@
 /**
  * Cedar Kids Therapy — Referral Inbox Triage Agent
  *
- * Selected tools (3 of 8):
+ * Selected tools (5 of 8):
  *   1. verify_insurance — result directly forks the workflow:
  *        in_network  → create intake task, proceed toward scheduling
  *        out_of_network / expired → create billing task, block slot hold
@@ -19,6 +19,15 @@
  *        intake       → new referrals ready to proceed
  *        front_desk   → scheduling changes, missing-info follow-ups
  *        Used for all 8 items — the assignee and notes reflect the triage decision.
+ *
+ *   4. find_slots — searches available appointment slots for a given discipline.
+ *        Called for scheduling / reschedule items (e.g. item 8) after escalate(),
+ *        so staff can see concrete options when they review the hold.
+ *
+ *   5. hold_slot — places the earliest suitable slot in pending_review status.
+ *        Called after find_slots when a matching slot exists. Always followed by
+ *        create_task so staff know to confirm or release the hold.
+ *        Result is always pending_review — this is NOT a confirmed appointment.
  *
  * Architecture:
  *   Phase 1  — Claude (claude-haiku-4-5-20251001) runs an agentic loop per item,
@@ -40,8 +49,10 @@ import {
   verify_insurance,
   escalate,
   create_task,
+  find_slots,
+  hold_slot,
 } from "./tools.js";
-import type { Assignee, InboxItem, ItemOutput } from "./types.js";
+import type { Assignee, Discipline, InboxItem, ItemOutput } from "./types.js";
 
 // ─── Clients ─────────────────────────────────────────────────────────────────
 
@@ -54,7 +65,7 @@ const MAX_TOOL_ROUNDS = 10;
 const MAX_REVISIONS = 2;
 
 // ─── Tool definitions exposed to Claude ──────────────────────────────────────
-// Only the 3 chosen tools. Claude cannot call any other tool.
+// 5 tools: verify_insurance, escalate, create_task, find_slots, hold_slot.
 
 const TOOL_DEFINITIONS: Anthropic.Tool[] = [
   {
@@ -107,7 +118,7 @@ const TOOL_DEFINITIONS: Anthropic.Tool[] = [
       "  clinical_lead → safeguarding escalations",
       "  billing       → out-of-network or unknown insurance, benefits conversations",
       "  intake        → new referrals ready to proceed, missing-info follow-ups",
-      "  front_desk    → scheduling changes, general parent communication",
+      "  front_desk    → scheduling changes, hold confirmations, general parent communication",
     ].join(" "),
     input_schema: {
       type: "object",
@@ -126,6 +137,57 @@ const TOOL_DEFINITIONS: Anthropic.Tool[] = [
       },
     },
   },
+  {
+    name: "find_slots",
+    description: [
+      "Search available appointment slots for a discipline.",
+      "Use for scheduling / reschedule items AFTER calling escalate().",
+      "Returns up to 5 slots with provider name, start time, and slot_id.",
+      "If no slots are found, do not call hold_slot; note availability in recommended_next_action.",
+    ].join(" "),
+    input_schema: {
+      type: "object",
+      properties: {
+        discipline: {
+          type: "string",
+          enum: ["SLP", "OT", "PT"],
+          description: "Therapy discipline to search — infer from the existing appointment context",
+        },
+        preferences: {
+          type: "string",
+          description: "Optional scheduling preferences from the family (e.g. mornings)",
+        },
+        language: {
+          type: "string",
+          description: "Language preference code: 'en' or 'es'",
+        },
+      },
+    },
+  },
+  {
+    name: "hold_slot",
+    description: [
+      "Place a slot in pending_review status for staff to confirm.",
+      "Only call after find_slots returns at least one slot.",
+      "Always use the earliest slot_id from find_slots results.",
+      "Result status is always pending_review — this is NOT a confirmed appointment.",
+      "Always follow this call with create_task so front_desk knows to review and confirm the hold.",
+    ].join(" "),
+    input_schema: {
+      type: "object",
+      required: ["slot_id", "patient_ref"],
+      properties: {
+        slot_id: {
+          type: "string",
+          description: "slot_id from find_slots result",
+        },
+        patient_ref: {
+          type: "string",
+          description: "Patient full name for the hold reference",
+        },
+      },
+    },
+  },
 ];
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -133,12 +195,20 @@ const TOOL_DEFINITIONS: Anthropic.Tool[] = [
 const SYSTEM_PROMPT = `You are a medical intake triage agent for Cedar Kids Therapy, a pediatric therapy practice for children ages 0–18.
 
 ## Your task
-Triage each referral inbox item. Use the 3 available tools to gather information and create follow-up tasks, then output a structured JSON triage record.
+Triage each referral inbox item. Use the available tools to gather information and create follow-up tasks, then output a structured JSON triage record.
 
 ## Tool usage rules
-- verify_insurance: call for EVERY item that includes payer or member_id. Use the result to decide the next action (in_network → intake; out_of_network → billing).
-- escalate: REQUIRED for safeguarding signals (P0) and same-day cancellations/reschedules (P1). Must be called before create_task for those items.
-- create_task: call for EVERY item to assign concrete staff follow-up. Assignee must match the situation. Always include patient name and relevant details in notes.
+- verify_insurance: call for EVERY item that includes payer or member_id. Use the result to decide the next action (in_network → intake; out_of_network/expired → billing; no slot hold for OON).
+- escalate: REQUIRED for safeguarding signals (P0) and same-day cancellations/reschedules (P1). Must be called before other tools for those items.
+- find_slots: call for scheduling/reschedule items (classification: "scheduling") to surface available slots for the patient's discipline. Call AFTER escalate.
+- hold_slot: call after find_slots when slots are available. Use the earliest slot_id. Result is always pending_review — NOT a confirmed appointment.
+- create_task: call for EVERY item to assign concrete staff follow-up. Must follow hold_slot with a task for front_desk to confirm the hold. Assignee must match the situation.
+
+## Reschedule workflow (e.g. same-day cancellation)
+1. escalate(item_id, reason, "P1")
+2. find_slots(discipline)  ← use the discipline from the patient's existing appointment
+3. hold_slot(slot_id, patient_ref)  ← earliest available slot; pending_review only
+4. create_task(front_desk, "Confirm reschedule hold for <patient>", due=today, notes including hold details)
 
 ## Classification guide
 - new_referral: complete or partial referral for a new evaluation
@@ -216,6 +286,14 @@ async function dispatchTool(
       return create_task(
         input as { assignee: Assignee; title: string; due: string; notes: string },
       );
+    case "find_slots":
+      return find_slots(
+        input as { discipline?: Discipline; preferences?: string; language?: string },
+      );
+    case "hold_slot":
+      return hold_slot(
+        input as { slot_id: string; patient_ref: string },
+      );
     default:
       throw new Error(`Tool not available in this agent: ${name}`);
   }
@@ -226,6 +304,7 @@ async function dispatchTool(
 interface TriageDraft {
   output: ItemOutput;
   taskIds: string[];
+  holdIds: string[];
   escalationResult: { reason: string; severity: "P0" | "P1" } | null;
   /** Plain-text log of tool calls for use in revision prompts */
   toolLog: string[];
@@ -236,6 +315,7 @@ async function triageWithClaude(
   feedbackFromReviewer: string | null,
 ): Promise<TriageDraft> {
   const taskIds: string[] = [];
+  const holdIds: string[] = [];
   let escalationResult: { reason: string; severity: "P0" | "P1" } | null = null;
   const toolLog: string[] = [];
 
@@ -270,7 +350,7 @@ async function triageWithClaude(
       parsed.escalation = escalationResult;
       parsed.requires_human_review = true;
 
-      return { output: parsed, taskIds, escalationResult, toolLog };
+      return { output: parsed, taskIds, holdIds, escalationResult, toolLog };
     }
 
     if (response.stop_reason === "tool_use") {
@@ -288,6 +368,9 @@ async function triageWithClaude(
 
           if (block.name === "create_task") {
             taskIds.push((result.data as { task_id: string }).task_id);
+          }
+          if (block.name === "hold_slot") {
+            holdIds.push((result.data as { hold_id: string }).hold_id);
           }
           if (block.name === "escalate") {
             const inp = block.input as {
@@ -392,10 +475,13 @@ Rules to enforce (check each one):
    classification must be "safeguarding", urgency must be "P0",
    escalation must not be null and severity must be "P0".
 2. SAME-DAY RESCHEDULE/CANCELLATION — classification "scheduling", urgency "P1",
-   escalation must not be null, severity "P1".
+   escalation must not be null and severity must be "P1",
+   tools_called must include find_slots (to surface available slots for staff review),
+   tools_called must include hold_slot (to place a pending_review hold),
+   tools_called must include create_task for front_desk to confirm the hold.
 3. OUT-OF-NETWORK insurance (Kaiser, Cigna Select, Beacon):
    tools_called must include verify_insurance;
-   recommended_next_action must NOT suggest hold_slot or scheduling.
+   recommended_next_action must NOT suggest hold_slot or confirmed scheduling.
 4. CLINICAL QUESTION — classification "clinical_question";
    draft_reply must NOT contain clinical advice or developmental assessments.
 5. INCOMPLETE REFERRAL — classification "missing_paperwork";
@@ -404,7 +490,7 @@ Rules to enforce (check each one):
 7. escalation must not be null for P0 or P1 items.
 8. tools_called must be non-empty (at least one tool was called).
 9. task_ids must be non-empty (at least one task was created per item).
-10. decision_rationale must reference the key finding (insurance status, safeguarding signal, etc.).
+10. decision_rationale must reference the key finding (insurance status, safeguarding signal, slot hold ID, etc.).
 `.trim();
 
 async function reviewWithOpenAI(

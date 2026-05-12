@@ -91,11 +91,21 @@ Dual-LLM single-agent pipeline. Claude performs triage with tool use; OpenAI act
 | `verify_insurance` | **Yes** | Result forks the workflow: in-network → intake task; out-of-network → billing task, no slot hold | 1, 3, 4, 7 |
 | `escalate` | **Yes** | Required by policy for P0 (safeguarding) and P1 (same-day changes); produces escalation_id | 2, 8 |
 | `create_task` | **Yes** | Creates concrete staff follow-up; assignee (billing/intake/clinical_lead/front_desk) reflects triage decision | 1–8 |
+| `find_slots` | **Yes** | Called for reschedule items after `escalate`; surfaces available slots so staff have options when reviewing the hold | 8 |
+| `hold_slot` | **Yes** | Called after `find_slots` when slots exist; places earliest slot in `pending_review`; result hold_id noted in task | 8 |
 | `search_patient` | No | Not selected — patient lookup not needed for first-contact triage of these 8 items | — |
 | `lookup_policy` | No | Not selected — policies are encoded in the system prompt; runtime lookups would be performative | — |
-| `find_slots` | No | Not selected — out-of-network items block slot holds; no item is fully cleared for hold in this batch | — |
-| `hold_slot` | No | Not selected — slot reservation requires billing clearance not yet done for any item | — |
 | `draft_message` | No | Not selected — outbound messages are represented in `draft_reply` field; extra tool call would duplicate that | — |
+
+### Reschedule workflow (item 8 — Noah Patel, same-day OT cancellation)
+```
+1. escalate(item_id="item_8", reason="Same-day OT cancellation", severity="P1")
+2. find_slots(discipline="OT")          → returns available OT evaluation slots
+3. hold_slot(slot_id=<earliest>, patient_ref="Noah Patel")
+                                         → status: pending_review (NOT confirmed)
+4. create_task(assignee="front_desk",    → staff must confirm/release the hold
+               notes include hold_id and contact info)
+```
 
 **Forbidden tools (must never appear in output or trace):** `schedule_appointment`, `send_message`
 
