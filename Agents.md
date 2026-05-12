@@ -22,36 +22,49 @@ Build a single AI agent that reads 8 referral inbox items for a pediatric therap
 data/inbox.json
       │
       ▼
- src/index.ts        ← CLI entry point, configures trace, calls runAgent()
+ src/index.ts              ← CLI entry point; configures trace; calls runAgent()
       │
       ▼
- src/agent.ts        ← YOUR IMPLEMENTATION: runAgent(inbox) → ItemOutput[]
+ src/agent.ts — runAgent() ← processes all 8 items sequentially
       │
-      ├── withItemContext(item.id, ...)   ← wraps each item for trace association
-      │
-      └── Tool calls (src/tools.ts)
-            ├── search_patient
-            ├── verify_insurance
-            ├── lookup_policy
-            ├── find_slots
-            ├── hold_slot
-            ├── create_task
-            ├── draft_message
-            └── escalate
+      └── per item: processItemWithReview(item)
+            │
+            ├─ Phase 1 ── withItemContext(item.id, triageWithClaude)
+            │               │
+            │               ├── Claude (claude-haiku-4-5-20251001)
+            │               │     Agentic loop: reasons about item,
+            │               │     calls tools until satisfied, then
+            │               │     emits final ItemOutput JSON
+            │               │
+            │               └── Tool dispatcher → src/tools.ts
+            │                     (calls are recorded in trace automatically)
+            │
+            ├─ Review ─── OpenAI (gpt-4o-mini)
+            │               Checks output against clinic policies.
+            │               Returns {approved, feedback}.
+            │
+            ├─ If rejected (attempt 1): re-run triageWithClaude with feedback
+            │               Claude has another chance to call tools and fix decisions
+            │
+            ├─ If rejected (attempt 2+): reviseWithClaude (no new tool calls)
+            │               Claude corrects its JSON using existing tool results
+            │               Trace stays clean — tools only called in Phase 1
+            │
+            └─ After MAX_REVIEW_RETRIES: use last output regardless
       │
       ▼
- buildBatchOutput()  ← wraps items into BatchOutput with summary stats
+ buildBatchOutput()        ← assembles BatchOutput with summary stats
       │
       ▼
  output.json + .trace/tool-calls.jsonl
       │
       ▼
- src/validate.ts     ← validates output against schema and business rules
+ src/validate.ts           ← validates output against schema and business rules
 ```
 
 ### Agent Type
 
-Single agent — no multi-agent orchestration. The agent processes all 8 inbox items sequentially (or in parallel), calling tools per item inside `withItemContext()` to maintain trace association.
+Dual-LLM single-agent pipeline. Claude performs triage with tool use; OpenAI acts as a policy-aware reviewer that can send corrective feedback back to Claude.
 
 ---
 
@@ -60,7 +73,8 @@ Single agent — no multi-agent orchestration. The agent processes all 8 inbox i
 | Layer | Choice | Notes |
 |-------|--------|-------|
 | Language | TypeScript | Node.js LTS, ESM modules |
-| LLM | Claude (Anthropic) | Via `@anthropic-ai/sdk` |
+| Triage LLM | Claude `claude-haiku-4-5-20251001` | Via `@anthropic-ai/sdk`; agentic loop with tool use |
+| Review LLM | OpenAI `gpt-4o-mini` | Via `openai` SDK; policy validation + feedback |
 | Tool Calling | Anthropic tool use API | 8 mock tools in `src/tools.ts` |
 | Validation | AJV + ajv-formats | Schema at `schema/output.schema.json` |
 | ID generation | ulid | For call_ids, task_ids, hold_ids |
@@ -177,8 +191,22 @@ npm run typecheck
 
 ```bash
 npm install
+
+# Copy and fill in API keys
+cp .env.example .env
+
+# Run triage
 npm run triage   -- --input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl
+
+# Validate output
 npm run validate -- --input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl
+
+# Type check
+npm run typecheck
 ```
 
-Requires `ANTHROPIC_API_KEY` environment variable set for the agent LLM calls.
+Required environment variables (set in `.env`):
+```
+ANTHROPIC_API_KEY=sk-ant-...   # Claude haiku for triage
+OPENAI_API_KEY=sk-...          # GPT-4o-mini for review
+```
