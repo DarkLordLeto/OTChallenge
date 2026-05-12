@@ -34,7 +34,19 @@
  *        the patient_id from search_patient. Always followed by create_task.
  *        Result is always pending_review — this is NOT a confirmed appointment.
  *
- *   7. draft_message — composes outbound replies as drafts; NEVER auto-sent.
+ *   7. lookup_policy — retrieves clinic policy snippets by topic.
+ *        Called before create_task or draft_message so the policy text
+ *        informs task notes and message bodies directly.
+ *        Topic is chosen to match the situation:
+ *          safeguarding    → before safeguarding task/message
+ *          insurance       → before OON billing task/message
+ *          clinical_advice → before clinical-question message
+ *          scheduling      → before reschedule task/message
+ *          cancellation    → before same-day cancellation task
+ *          language_access → before Spanish-language message
+ *          service_lines   → before new-referral intake task
+ *
+ *   8. draft_message — composes outbound replies as drafts; NEVER auto-sent.
  *        Called for every item that warrants a reply to the family or referrer.
  *        The `body` arg is captured and surfaced as `draft_reply` in the output.
  *        Channel is chosen from context (email/phone/portal); language "es" for
@@ -58,13 +70,14 @@ import {
   getToolCallsForItem,
   search_patient,
   verify_insurance,
+  lookup_policy,
   escalate,
   create_task,
   find_slots,
   hold_slot,
   draft_message,
 } from "./tools.js";
-import type { Assignee, Discipline, InboxItem, ItemOutput } from "./types.js";
+import type { Assignee, Discipline, InboxItem, ItemOutput, PolicyTopic } from "./types.js";
 
 // ─── Clients ─────────────────────────────────────────────────────────────────
 
@@ -95,6 +108,40 @@ const TOOL_DEFINITIONS: Anthropic.Tool[] = [
       properties: {
         payer: { type: "string", description: "Insurance payer name from the item" },
         member_id: { type: "string", description: "Member ID from the item" },
+      },
+    },
+  },
+  {
+    name: "lookup_policy",
+    description: [
+      "Retrieve clinic policy snippets for a topic.",
+      "Call this BEFORE create_task or draft_message so the returned snippets inform the task notes and message body.",
+      "Choose the topic that matches the item's situation:",
+      "  safeguarding   → before any safeguarding-related task or message",
+      "  insurance      → before any billing task or OON-related message",
+      "  clinical_advice → before any clinical-question message",
+      "  scheduling     → before any reschedule task or message",
+      "  cancellation   → before any same-day cancellation task",
+      "  language_access → before any Spanish-language message",
+      "  service_lines  → before any new-referral intake task",
+    ].join(" "),
+    input_schema: {
+      type: "object",
+      required: ["topic"],
+      properties: {
+        topic: {
+          type: "string",
+          enum: [
+            "service_lines",
+            "insurance",
+            "safeguarding",
+            "clinical_advice",
+            "scheduling",
+            "cancellation",
+            "language_access",
+          ],
+          description: "Policy topic matching the current item situation",
+        },
       },
     },
   },
@@ -268,21 +315,32 @@ const SYSTEM_PROMPT = `You are a medical intake triage agent for Cedar Kids Ther
 Triage each referral inbox item. Use the available tools to gather information and create follow-up tasks, then output a structured JSON triage record.
 
 ## Tool usage rules
-- verify_insurance: call for EVERY item that includes payer or member_id. Use the result to decide the next action (in_network → intake; out_of_network/expired → billing; no slot hold for OON).
-- escalate: REQUIRED for safeguarding signals (P0) and same-day cancellations/reschedules (P1). Must be called before other tools for those items.
+- verify_insurance: call for EVERY item that includes payer or member_id. Result determines the follow-up path (in_network → intake; out_of_network/expired → billing; no slot hold for OON).
+- lookup_policy: call BEFORE create_task or draft_message using the topic that matches the item. Use the returned snippets to make task notes and message bodies accurate and policy-compliant.
+- escalate: REQUIRED for safeguarding signals (P0) and same-day cancellations/reschedules (P1). Call before other action tools for those items.
 - search_patient: call for scheduling/reschedule items to verify the patient record. Use the returned patient_id as patient_ref in hold_slot.
 - find_slots: call after search_patient for scheduling/reschedule items to surface available slots for the patient's discipline.
-- hold_slot: call after find_slots when slots are available. Use the earliest slot_id and the patient_id from search_patient as patient_ref. Result is always pending_review — NOT a confirmed appointment.
-- create_task: call for EVERY item to assign concrete staff follow-up. Must follow hold_slot with a task for front_desk to confirm the hold. Assignee must match the situation.
-- draft_message: call for EVERY item that warrants an outbound reply. The body you write becomes the draft_reply field — leave draft_reply null in your JSON. Message is never auto-sent.
+- hold_slot: call after find_slots when slots are available. Use the earliest slot_id and patient_id from search_patient as patient_ref. Result is always pending_review — NOT a confirmed appointment.
+- create_task: call for EVERY item. Notes must reflect the lookup_policy snippets retrieved. Assignee must match the situation.
+- draft_message: call for EVERY item that warrants an outbound reply. Body must reflect lookup_policy snippets. Becomes draft_reply — leave that field null in JSON. Never auto-sent.
 
 ## Reschedule workflow (e.g. same-day cancellation)
 1. escalate(item_id, reason, "P1")
-2. search_patient(name, dob)          ← verify the patient record; capture patient_id
-3. find_slots(discipline)             ← discipline from the patient's existing appointment
-4. hold_slot(slot_id, patient_ref)    ← earliest slot; patient_ref = patient_id from step 2
-5. create_task(front_desk, "Confirm reschedule hold for <patient>", due=today, notes with patient_id + hold_id)
-6. draft_message(recipient, channel, body mentioning the pending hold and next steps)
+2. search_patient(name, dob)              ← verify record; capture patient_id
+3. lookup_policy("scheduling")            ← get policy snippets before writing task + message
+4. find_slots(discipline)                 ← discipline from patient's existing appointment
+5. hold_slot(slot_id, patient_ref)        ← earliest slot; patient_ref = patient_id from step 2
+6. create_task(front_desk, notes citing policy snippets + patient_id + hold_id)
+7. draft_message(recipient, channel, body citing policy snippets + hold details)
+
+## Policy topic per situation
+- Safeguarding item        → lookup_policy("safeguarding")
+- OON / billing issue      → lookup_policy("insurance")
+- Clinical question        → lookup_policy("clinical_advice")
+- Same-day reschedule      → lookup_policy("scheduling")
+- Same-day cancellation    → lookup_policy("cancellation")
+- Spanish-speaking family  → lookup_policy("language_access")
+- New referral             → lookup_policy("service_lines")
 
 ## Classification guide
 - new_referral: complete or partial referral for a new evaluation
@@ -355,6 +413,10 @@ async function dispatchTool(
     case "verify_insurance":
       return verify_insurance(
         input as { payer?: string; member_id?: string },
+      );
+    case "lookup_policy":
+      return lookup_policy(
+        input as { topic: PolicyTopic },
       );
     case "escalate":
       return escalate(
