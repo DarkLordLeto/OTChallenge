@@ -29,6 +29,12 @@
  *        create_task so staff know to confirm or release the hold.
  *        Result is always pending_review — this is NOT a confirmed appointment.
  *
+ *   6. draft_message — composes outbound replies as drafts; NEVER auto-sent.
+ *        Called for every item that warrants a reply to the family or referrer.
+ *        The `body` arg is captured and surfaced as `draft_reply` in the output.
+ *        Channel is chosen from context (email/phone/portal); language "es" for
+ *        Spanish-speaking families. Safeguarding replies are neutral ack only.
+ *
  * Architecture:
  *   Phase 1  — Claude (claude-haiku-4-5-20251001) runs an agentic loop per item,
  *              calling the 3 tools above inside withItemContext() so every call
@@ -50,6 +56,7 @@ import {
   create_task,
   find_slots,
   hold_slot,
+  draft_message,
 } from "./tools.js";
 import type { Assignee, Discipline, InboxItem, ItemOutput } from "./types.js";
 
@@ -186,6 +193,42 @@ const TOOL_DEFINITIONS: Anthropic.Tool[] = [
       },
     },
   },
+  {
+    name: "draft_message",
+    description: [
+      "Compose an outbound reply as a draft. The message is NEVER sent automatically.",
+      "Call this for every item that warrants a reply to the family or referring provider.",
+      "The body you write becomes the draft_reply in the output — do NOT write draft_reply in your JSON.",
+      "Channel rules: use 'email' when an email address is present, 'phone' when only a phone number exists, 'portal' for portal_message items.",
+      "Language rules: use language='es' and write the body in Spanish for Spanish-speaking families.",
+      "Safeguarding items (P0): body must be a neutral acknowledgement only — no clinical or investigative content.",
+      "Clinical questions: body must route to clinician review — never include clinical advice.",
+    ].join(" "),
+    input_schema: {
+      type: "object",
+      required: ["recipient", "channel", "body"],
+      properties: {
+        recipient: {
+          type: "string",
+          description: "Recipient name or email address",
+        },
+        channel: {
+          type: "string",
+          enum: ["portal", "email", "phone"],
+          description: "Communication channel — infer from item context",
+        },
+        body: {
+          type: "string",
+          description: "Full message body. This text becomes the draft_reply field.",
+        },
+        language: {
+          type: "string",
+          enum: ["en", "es"],
+          description: "Message language — use 'es' for Spanish-speaking families",
+        },
+      },
+    },
+  },
 ];
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -201,12 +244,14 @@ Triage each referral inbox item. Use the available tools to gather information a
 - find_slots: call for scheduling/reschedule items (classification: "scheduling") to surface available slots for the patient's discipline. Call AFTER escalate.
 - hold_slot: call after find_slots when slots are available. Use the earliest slot_id. Result is always pending_review — NOT a confirmed appointment.
 - create_task: call for EVERY item to assign concrete staff follow-up. Must follow hold_slot with a task for front_desk to confirm the hold. Assignee must match the situation.
+- draft_message: call for EVERY item that warrants an outbound reply. The body you write becomes the draft_reply field — leave draft_reply null in your JSON. Message is never auto-sent.
 
 ## Reschedule workflow (e.g. same-day cancellation)
 1. escalate(item_id, reason, "P1")
 2. find_slots(discipline)  ← use the discipline from the patient's existing appointment
 3. hold_slot(slot_id, patient_ref)  ← earliest available slot; pending_review only
 4. create_task(front_desk, "Confirm reschedule hold for <patient>", due=today, notes including hold details)
+5. draft_message(recipient, channel, body mentioning the pending hold and next steps)
 
 ## Classification guide
 - new_referral: complete or partial referral for a new evaluation
@@ -227,9 +272,9 @@ Triage each referral inbox item. Use the available tools to gather information a
 ## Critical policies
 1. requires_human_review must always be true.
 2. Out-of-network insurance (Kaiser, Cigna Select, Beacon): do NOT recommend hold_slot; billing must discuss benefits first.
-3. Clinical questions: do NOT provide clinical advice in draft_reply; route to clinician review.
-4. Safeguarding: draft_reply must be neutral acknowledgement only — no investigative content.
-5. Spanish-speaking families: draft_reply in Spanish when possible.
+3. Clinical questions: draft_message body must NOT contain clinical advice; acknowledge and route to clinician.
+4. Safeguarding: draft_message body must be a neutral acknowledgement only — no investigative content.
+5. Spanish-speaking families: call draft_message with language="es" and write the body in Spanish.
 6. FORBIDDEN: never call schedule_appointment or send_message.
 
 ## Output format
@@ -251,12 +296,12 @@ After finishing tool calls, respond with ONLY a raw JSON object (no markdown fen
   "missing_info": ["<field name>", ...],
   "tools_called": [],
   "recommended_next_action": "<one clear sentence>",
-  "draft_reply": "<message text or null>",
+  "draft_reply": null,
   "task_ids": [],
   "escalation": {"reason": "<string>", "severity": "P0|P1"} or null,
   "decision_rationale": "<2–3 sentences explaining classification, urgency, and key findings>"
 }
-Leave tools_called and task_ids empty — they are populated from the execution trace.`;
+Leave tools_called, task_ids, and draft_reply as empty/null — they are populated from the execution trace.`;
 
 // ─── Tool dispatcher ──────────────────────────────────────────────────────────
 
@@ -292,6 +337,15 @@ async function dispatchTool(
       return hold_slot(
         input as { slot_id: string; patient_ref: string },
       );
+    case "draft_message":
+      return draft_message(
+        input as {
+          recipient: string;
+          channel: "portal" | "email" | "phone";
+          body: string;
+          language?: "en" | "es";
+        },
+      );
     default:
       throw new Error(`Tool not available in this agent: ${name}`);
   }
@@ -303,6 +357,8 @@ interface TriageDraft {
   output: ItemOutput;
   taskIds: string[];
   holdIds: string[];
+  /** Body text from the draft_message tool call — populates draft_reply in output */
+  draftReply: string | null;
   escalationResult: { reason: string; severity: "P0" | "P1" } | null;
   /** Plain-text log of tool calls for use in revision prompts */
   toolLog: string[];
@@ -314,6 +370,7 @@ async function triageWithClaude(
 ): Promise<TriageDraft> {
   const taskIds: string[] = [];
   const holdIds: string[] = [];
+  let draftReply: string | null = null;
   let escalationResult: { reason: string; severity: "P0" | "P1" } | null = null;
   const toolLog: string[] = [];
 
@@ -345,10 +402,11 @@ async function triageWithClaude(
       // Authoritative overrides from actual execution
       parsed.tools_called = getToolCallsForItem(item.id);
       parsed.task_ids = taskIds;
+      parsed.draft_reply = draftReply;
       parsed.escalation = escalationResult;
       parsed.requires_human_review = true;
 
-      return { output: parsed, taskIds, holdIds, escalationResult, toolLog };
+      return { output: parsed, taskIds, holdIds, draftReply, escalationResult, toolLog };
     }
 
     if (response.stop_reason === "tool_use") {
@@ -369,6 +427,10 @@ async function triageWithClaude(
           }
           if (block.name === "hold_slot") {
             holdIds.push((result.data as { hold_id: string }).hold_id);
+          }
+          if (block.name === "draft_message") {
+            // Capture the message body as the authoritative draft_reply
+            draftReply = (block.input as { body: string }).body;
           }
           if (block.name === "escalate") {
             const inp = block.input as {
@@ -451,9 +513,10 @@ async function reviseOutput(
     textBlock && textBlock.type === "text" ? textBlock.text.trim() : "{}";
   const revised = parseItemOutput(raw, item.id);
 
-  // tools_called, task_ids, and escalation come from Phase 1 and never change
+  // These all come from Phase 1 tool execution and never change in revision
   revised.tools_called = previous.tools_called;
   revised.task_ids = previous.task_ids;
+  revised.draft_reply = previous.draft_reply;
   revised.escalation = previous.escalation ?? revised.escalation;
   revised.requires_human_review = true;
 
@@ -489,6 +552,7 @@ Rules to enforce (check each one):
 8. tools_called must be non-empty (at least one tool was called).
 9. task_ids must be non-empty (at least one task was created per item).
 10. decision_rationale must reference the key finding (insurance status, safeguarding signal, slot hold ID, etc.).
+11. draft_reply must not be null — a draft_message tool call must have been made for every item.
 `.trim();
 
 async function reviewWithClaude(
@@ -567,6 +631,7 @@ async function processItem(item: InboxItem): Promise<ItemOutput> {
     // Ensure authoritative trace values are preserved after revision
     output.tools_called = getToolCallsForItem(item.id);
     output.task_ids = draft.taskIds;
+    output.draft_reply = draft.draftReply;
     output.escalation = draft.escalationResult;
     output.requires_human_review = true;
   }
